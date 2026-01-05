@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 - This CHANGELOG.md
 
 ### Changed
-- Shorted label box to be a square color swatch button
+- Shortened label box to be a square color swatch button
 
 ## [1.0.0] - 2026-01-03
 
