@@ -16,7 +16,7 @@ from typing import Optional, List, Dict, Tuple
 
 from krita import Extension, Krita
 
-from PyQt5.QtCore import Qt, QTimer, QObject, QSize
+from PyQt5.QtCore import Qt, QTimer, QObject, QSize, QEvent
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QDockWidget,
@@ -88,6 +88,104 @@ def _find_action_by_text(needles: List[str]):
         if all(n in text for n in needles_l):
             return act
     return None
+
+
+class MoveLayerToolButton(QToolButton):
+    """
+    Custom QToolButton that handles both left-click (normal move) and 
+    right-click (move to absolute top/bottom of layer tree).
+    
+    Left-click: Move layer one position up/down
+    Right-click: Move layer to absolute top/bottom of entire layer stack
+    """
+    
+    def __init__(self, patcher: 'LayersDockerPatcher', is_move_up: bool, parent: QWidget = None):
+        super().__init__(parent)
+        self._patcher = patcher
+        self._is_move_up = is_move_up
+        
+        # Configure button appearance to match Krita's style
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.NoFocus)
+        
+        # Set tooltip
+        if is_move_up:
+            self.setToolTip("Move Layer Up\nRight-click: Move to Top of Layer Stack")
+            self.setObjectName("btnMoveUp_LayerKit")
+        else:
+            self.setToolTip("Move Layer Down\nRight-click: Move to Bottom of Layer Stack")
+            self.setObjectName("btnMoveDown_LayerKit")
+    
+    def set_icon_from_button(self, original_button: QToolButton) -> None:
+        """Copy icon and size from original button."""
+        if original_button is None:
+            return
+        try:
+            icon = original_button.icon()
+            if not icon.isNull():
+                self.setIcon(icon)
+            icon_size = original_button.iconSize()
+            if not icon_size.isEmpty():
+                self.setIconSize(icon_size)
+            # Match size policies
+            self.setMinimumSize(original_button.minimumSize())
+            self.setMaximumSize(original_button.maximumSize())
+            size_hint = original_button.sizeHint()
+            if size_hint.isValid():
+                self.setFixedSize(size_hint)
+        except Exception:
+            pass
+    
+    def mousePressEvent(self, event) -> None:
+        """Handle mouse button press events."""
+        if event.button() == Qt.LeftButton:
+            # Left-click: normal move up/down one position
+            self._do_single_move()
+            event.accept()
+        elif event.button() == Qt.RightButton:
+            # Right-click: move to absolute top/bottom
+            if self._is_move_up:
+                self._patcher._move_to_top()
+            else:
+                self._patcher._move_to_bottom()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+    
+    def mouseReleaseEvent(self, event) -> None:
+        """Handle mouse release - consume to prevent unwanted behavior."""
+        event.accept()
+    
+    def contextMenuEvent(self, event) -> None:
+        """Override to prevent context menu from appearing on right-click."""
+        event.accept()
+    
+    def _do_single_move(self) -> None:
+        """Perform a single move up or down."""
+        if self._is_move_up:
+            action = _find_action_by_ids([
+                "move_layer_up",
+                "raise_layer",
+                "layer_raise",
+                "RaiseLayers",
+            ])
+            if action is None:
+                action = _find_action_by_text(["raise", "layer"])
+        else:
+            action = _find_action_by_ids([
+                "move_layer_down",
+                "lower_layer",
+                "layer_lower",
+                "LowerLayers",
+            ])
+            if action is None:
+                action = _find_action_by_text(["lower", "layer"])
+        
+        if action is not None:
+            try:
+                action.trigger()
+            except Exception:
+                pass
 
 
 class GroupLayerLabeler(QObject):
@@ -235,10 +333,17 @@ class LayersDockerPatcher(QObject):
         self.tree: Optional[QTreeView] = None
         self._labeler: Optional[GroupLayerLabeler] = None
         self._patched_buttons = set()  # Track what we've already added
+        
+        # Store references to our custom buttons to prevent garbage collection
+        self._move_up_button: Optional[QToolButton] = None
+        self._move_down_button: Optional[QToolButton] = None
+        self._original_raise: Optional[QToolButton] = None
+        self._original_lower: Optional[QToolButton] = None
 
     def apply(self) -> None:
         self._add_group_button()
         self._add_clipping_mask_button()
+        self._patch_move_buttons()
         self._install_group_layer_labeling()
 
     def _add_group_button(self) -> None:
@@ -307,6 +412,367 @@ class LayersDockerPatcher(QObject):
             hbox1.insertWidget(1, btn)
         
         self._patched_buttons.add(btn_name)
+
+    def _patch_move_buttons(self) -> None:
+        """
+        Hide the original bnRaise and bnLower buttons and replace them with
+        custom MoveLayerToolButton instances that support right-click for
+        move-to-top and move-to-bottom functionality.
+        
+        The buttons are placed after bnDuplicate in order: Move Up, then Move Down.
+        This matches the visual expectation (up arrow before down arrow).
+        
+        Original Krita layout (from WdgLayerBox.ui):
+        hbox1: bnAdd, bnDuplicate, bnLower, bnRaise, bnProperties, spacer, bnDelete
+        
+        After patching (visible buttons):
+        hbox1: bnAdd, bnDuplicate, [MoveUp], [MoveDown], bnProperties, spacer, bnDelete
+        """
+        patch_name = "moveButtonsReplaced_LayerKit"
+        
+        # Check if already patched
+        if patch_name in self._patched_buttons:
+            return
+        if self.docker.property(patch_name) is True:
+            self._patched_buttons.add(patch_name)
+            return
+        
+        # Find the original move buttons by object name
+        bn_raise = self.docker.findChild(QToolButton, "bnRaise")  # Move Up
+        bn_lower = self.docker.findChild(QToolButton, "bnLower")  # Move Down
+        
+        if bn_raise is None and bn_lower is None:
+            return  # No buttons found, can't patch
+        
+        # Find bnDuplicate as our reference point for positioning
+        bn_duplicate = self.docker.findChild(QToolButton, "bnDuplicate")
+        
+        # Find hbox1 layout by name first (same approach as _add_group_button)
+        hbox1 = self.docker.findChild(QHBoxLayout, "hbox1")
+        
+        # Get the parent widget that contains the buttons
+        parent_widget = None
+        if bn_duplicate is not None:
+            parent_widget = bn_duplicate.parentWidget()
+        elif bn_raise is not None:
+            parent_widget = bn_raise.parentWidget()
+        elif bn_lower is not None:
+            parent_widget = bn_lower.parentWidget()
+        
+        if parent_widget is None:
+            return
+        
+        # If hbox1 not found by name, get layout from parent widget
+        if hbox1 is None:
+            hbox1 = parent_widget.layout()
+        
+        if hbox1 is None:
+            return
+        
+        # Find the index of bnDuplicate to use as insertion reference
+        duplicate_index = -1
+        if bn_duplicate is not None:
+            duplicate_index = self._index_of_widget(hbox1, bn_duplicate)
+        
+        # Hide the original buttons
+        if bn_raise is not None:
+            self._original_raise = bn_raise
+            bn_raise.hide()
+            bn_raise.setEnabled(False)
+        
+        if bn_lower is not None:
+            self._original_lower = bn_lower
+            bn_lower.hide()
+            bn_lower.setEnabled(False)
+        
+        # Determine insertion position (right after bnDuplicate)
+        # If bnDuplicate not found, try to find where the original buttons were
+        if duplicate_index >= 0:
+            insert_pos = duplicate_index + 1
+        else:
+            # Fallback: find position of first original button in hbox1
+            insert_pos = -1
+            if bn_lower is not None:
+                insert_pos = self._index_of_widget(hbox1, bn_lower)
+            if insert_pos < 0 and bn_raise is not None:
+                insert_pos = self._index_of_widget(hbox1, bn_raise)
+            if insert_pos < 0:
+                insert_pos = 2  # Default fallback position after bnAdd and bnDuplicate
+        
+        # Create Move Up button first (it should appear first, leftmost)
+        self._move_up_button = MoveLayerToolButton(
+            patcher=self,
+            is_move_up=True,
+            parent=parent_widget
+        )
+        
+        # Copy icon from original bnRaise button
+        if bn_raise is not None:
+            self._move_up_button.set_icon_from_button(bn_raise)
+        
+        # Insert Move Up button into hbox1
+        hbox1.insertWidget(insert_pos, self._move_up_button)
+        self._move_up_button.show()
+        
+        # Create Move Down button (it should appear second, to the right of Move Up)
+        self._move_down_button = MoveLayerToolButton(
+            patcher=self,
+            is_move_up=False,
+            parent=parent_widget
+        )
+        
+        # Copy icon from original bnLower button
+        if bn_lower is not None:
+            self._move_down_button.set_icon_from_button(bn_lower)
+        
+        # Insert Move Down button right after Move Up (insert_pos + 1)
+        hbox1.insertWidget(insert_pos + 1, self._move_down_button)
+        self._move_down_button.show()
+        
+        self._patched_buttons.add(patch_name)
+        self.docker.setProperty(patch_name, True)
+
+    def _move_to_top(self) -> None:
+        """
+        Move the currently selected layer to the very top of the ENTIRE layer tree.
+        
+        Uses Krita's raise_layer action repeatedly to properly handle groups with
+        their subcontents and multiple layer selections.
+        """
+        app = Krita.instance()
+        doc = app.activeDocument()
+        if doc is None:
+            return
+        
+        try:
+            node = doc.activeNode()
+        except Exception:
+            node = None
+        if node is None:
+            return
+        
+        try:
+            root = doc.rootNode()
+        except Exception:
+            root = None
+        if root is None:
+            return
+        
+        # Get root level children
+        try:
+            root_children = root.childNodes() if callable(getattr(root, "childNodes", None)) else []
+        except Exception:
+            root_children = []
+        
+        if not root_children:
+            return
+        
+        # Get unique ID of current node
+        node_uid = None
+        try:
+            if callable(getattr(node, "uniqueId", None)):
+                node_uid = node.uniqueId()
+        except Exception:
+            pass
+        
+        # Check if already at absolute top (is the last child of root)
+        top_node = root_children[-1]
+        try:
+            top_uid = top_node.uniqueId() if callable(getattr(top_node, "uniqueId", None)) else None
+            if node_uid is not None and top_uid is not None and node_uid == top_uid:
+                return  # Already at top
+        except Exception:
+            pass
+        
+        # Use raise_layer action repeatedly to move to absolute top
+        raise_action = _find_action_by_ids([
+            "move_layer_up",
+            "raise_layer",
+            "layer_raise",
+            "RaiseLayers",
+        ])
+        if raise_action is None:
+            raise_action = _find_action_by_text(["raise", "layer"])
+        
+        if raise_action is None:
+            return
+        
+        max_moves = len(root_children) + 50  # Safety limit
+        
+        for _ in range(max_moves):
+            try:
+                raise_action.trigger()
+                
+                # Check if we've reached top
+                doc_now = app.activeDocument()
+                if doc_now is None:
+                    break
+                    
+                current_node = doc_now.activeNode()
+                if current_node is None:
+                    break
+                
+                root_now = doc_now.rootNode()
+                if root_now is None:
+                    break
+                    
+                children_now = root_now.childNodes() if callable(getattr(root_now, "childNodes", None)) else []
+                if not children_now:
+                    break
+                
+                # Check if current node is now at top (last child)
+                current_uid = current_node.uniqueId() if callable(getattr(current_node, "uniqueId", None)) else None
+                last_uid = children_now[-1].uniqueId() if callable(getattr(children_now[-1], "uniqueId", None)) else None
+                
+                if current_uid is not None and last_uid is not None and current_uid == last_uid:
+                    break  # Reached top
+                    
+            except Exception:
+                break
+
+    def _move_to_bottom(self) -> None:
+        """
+        Move the currently selected layer to the very bottom of the ENTIRE layer tree.
+        
+        Note: Krita's Python API addChildNode(child, above) works as follows:
+        - When 'above' is None, it actually adds at childCount() (TOP of stack)
+        - When 'above' is a node, it places 'child' above that node
+        
+        To place at the absolute bottom, we need a workaround since we can't
+        directly specify "below" a node. We'll use repeated lower_layer action
+        as a fallback since the direct API doesn't support true bottom placement.
+        """
+        app = Krita.instance()
+        doc = app.activeDocument()
+        if doc is None:
+            return
+        
+        try:
+            node = doc.activeNode()
+        except Exception:
+            node = None
+        if node is None:
+            return
+        
+        try:
+            root = doc.rootNode()
+        except Exception:
+            root = None
+        if root is None:
+            return
+        
+        # Get root level children
+        try:
+            root_children = root.childNodes() if callable(getattr(root, "childNodes", None)) else []
+        except Exception:
+            root_children = []
+        
+        if not root_children:
+            return
+        
+        # Get unique ID of current node
+        node_uid = None
+        try:
+            if callable(getattr(node, "uniqueId", None)):
+                node_uid = node.uniqueId()
+        except Exception:
+            pass
+        
+        # Check if already at absolute bottom (is the first child of root)
+        bottom_node = root_children[0]
+        try:
+            bottom_uid = bottom_node.uniqueId() if callable(getattr(bottom_node, "uniqueId", None)) else None
+            if node_uid is not None and bottom_uid is not None and node_uid == bottom_uid:
+                return  # Already at bottom
+        except Exception:
+            pass
+        
+        # Strategy: Move node to root level first (if nested), then use
+        # Krita's lower_layer action repeatedly to move to bottom.
+        # This is because addChildNode(node, None) actually adds at TOP.
+        
+        # First, check if node is nested inside a group - if so, move to root
+        try:
+            parent = node.parentNode() if callable(getattr(node, "parentNode", None)) else None
+            parent_uid = None
+            if parent is not None and callable(getattr(parent, "uniqueId", None)):
+                parent_uid = parent.uniqueId()
+            
+            root_uid = None
+            if callable(getattr(root, "uniqueId", None)):
+                root_uid = root.uniqueId()
+            
+            is_at_root = (parent_uid is not None and root_uid is not None and parent_uid == root_uid)
+            
+            if not is_at_root and parent is not None:
+                # Node is nested, need to move to root first
+                if callable(getattr(node, "remove", None)):
+                    node.remove()
+                
+                # Add to root - but addChildNode(node, None) puts at TOP
+                # So we add at top first, then lower repeatedly
+                if callable(getattr(root, "addChildNode", None)):
+                    root.addChildNode(node, None)  # This puts it at top
+                
+                if callable(getattr(doc, "refreshProjection", None)):
+                    doc.refreshProjection()
+                
+                if callable(getattr(doc, "setActiveNode", None)):
+                    doc.setActiveNode(node)
+        except Exception:
+            pass
+        
+        # Now use lower_layer action repeatedly to move to absolute bottom
+        lower_action = _find_action_by_ids([
+            "move_layer_down",
+            "lower_layer",
+            "layer_lower",
+            "LowerLayers",
+        ])
+        if lower_action is None:
+            lower_action = _find_action_by_text(["lower", "layer"])
+        
+        if lower_action is None:
+            return
+        
+        # Get fresh root children count after potential move
+        try:
+            root_children = root.childNodes() if callable(getattr(root, "childNodes", None)) else []
+        except Exception:
+            root_children = []
+        
+        max_moves = len(root_children) + 50  # Safety limit
+        
+        for _ in range(max_moves):
+            try:
+                lower_action.trigger()
+                
+                # Check if we've reached bottom
+                doc_now = app.activeDocument()
+                if doc_now is None:
+                    break
+                    
+                current_node = doc_now.activeNode()
+                if current_node is None:
+                    break
+                
+                root_now = doc_now.rootNode()
+                if root_now is None:
+                    break
+                    
+                children_now = root_now.childNodes() if callable(getattr(root_now, "childNodes", None)) else []
+                if not children_now:
+                    break
+                
+                # Check if current node is now at bottom (first child)
+                current_uid = current_node.uniqueId() if callable(getattr(current_node, "uniqueId", None)) else None
+                first_uid = children_now[0].uniqueId() if callable(getattr(children_now[0], "uniqueId", None)) else None
+                
+                if current_uid is not None and first_uid is not None and current_uid == first_uid:
+                    break  # Reached bottom
+                    
+            except Exception:
+                break
 
     def _add_clipping_mask_button(self) -> None:
         """Add the 'Clipping Mask' button to the left of the opacity slider in opacityLayout."""
@@ -805,7 +1271,193 @@ class LayerKitExtension(Extension):
         pass
 
     def createActions(self, window):
-        pass
+        """Create keyboard-bindable actions for Layer Kit functionality."""
+        # Move to Top of Layer Stack action
+        action_move_top = window.createAction(
+            "layer_kit_move_to_top",
+            "Move to Top of Layer Stack",
+            "Scripts/Layer Kit"
+        )
+        action_move_top.triggered.connect(self._action_move_to_top)
+
+        # Move to Bottom of Layer Stack action
+        action_move_bottom = window.createAction(
+            "layer_kit_move_to_bottom",
+            "Move to Bottom of Layer Stack",
+            "Scripts/Layer Kit"
+        )
+        action_move_bottom.triggered.connect(self._action_move_to_bottom)
+
+        # Create Clipping Mask action
+        action_clipping_mask = window.createAction(
+            "layer_kit_create_clipping_mask",
+            "Create Clipping Mask",
+            "Scripts/Layer Kit"
+        )
+        action_clipping_mask.triggered.connect(self._action_create_clipping_mask)
+
+    def _get_active_patcher(self) -> Optional[LayersDockerPatcher]:
+        """Get the patcher for the currently active window's docker."""
+        try:
+            win = Krita.instance().activeWindow()
+            if win is None:
+                return None
+            qwin = win.qwindow()
+            if qwin is None:
+                return None
+            docker = qwin.findChild(QDockWidget, "KisLayerBox")
+            if docker is None:
+                return None
+            docker_id = int(id(docker))
+            return self._patchers.get(docker_id)
+        except Exception:
+            return None
+
+    def _action_move_to_top(self) -> None:
+        """Action handler for Move to Top of Layer Stack."""
+        patcher = self._get_active_patcher()
+        if patcher is not None:
+            patcher._move_to_top()
+        else:
+            # Fallback: create a temporary patcher-like move operation
+            self._fallback_move_to_top()
+
+    def _action_move_to_bottom(self) -> None:
+        """Action handler for Move to Bottom of Layer Stack."""
+        patcher = self._get_active_patcher()
+        if patcher is not None:
+            patcher._move_to_bottom()
+        else:
+            # Fallback: create a temporary patcher-like move operation
+            self._fallback_move_to_bottom()
+
+    def _action_create_clipping_mask(self) -> None:
+        """Action handler for Create Clipping Mask."""
+        patcher = self._get_active_patcher()
+        if patcher is not None:
+            patcher._do_clipping_mask_sequence()
+
+    def _fallback_move_to_top(self) -> None:
+        """Fallback move to top when no patcher is available."""
+        app = Krita.instance()
+        doc = app.activeDocument()
+        if doc is None:
+            return
+
+        try:
+            node = doc.activeNode()
+        except Exception:
+            node = None
+        if node is None:
+            return
+
+        try:
+            root = doc.rootNode()
+        except Exception:
+            root = None
+        if root is None:
+            return
+
+        try:
+            root_children = root.childNodes() if callable(getattr(root, "childNodes", None)) else []
+        except Exception:
+            root_children = []
+
+        if not root_children:
+            return
+
+        # Use raise_layer action repeatedly
+        raise_action = _find_action_by_ids([
+            "move_layer_up", "raise_layer", "layer_raise", "RaiseLayers",
+        ])
+        if raise_action is None:
+            raise_action = _find_action_by_text(["raise", "layer"])
+        if raise_action is None:
+            return
+
+        max_moves = len(root_children) + 50
+        for _ in range(max_moves):
+            try:
+                raise_action.trigger()
+                doc_now = app.activeDocument()
+                if doc_now is None:
+                    break
+                current_node = doc_now.activeNode()
+                if current_node is None:
+                    break
+                root_now = doc_now.rootNode()
+                if root_now is None:
+                    break
+                children_now = root_now.childNodes() if callable(getattr(root_now, "childNodes", None)) else []
+                if not children_now:
+                    break
+                current_uid = current_node.uniqueId() if callable(getattr(current_node, "uniqueId", None)) else None
+                last_uid = children_now[-1].uniqueId() if callable(getattr(children_now[-1], "uniqueId", None)) else None
+                if current_uid is not None and last_uid is not None and current_uid == last_uid:
+                    break
+            except Exception:
+                break
+
+    def _fallback_move_to_bottom(self) -> None:
+        """Fallback move to bottom when no patcher is available."""
+        app = Krita.instance()
+        doc = app.activeDocument()
+        if doc is None:
+            return
+
+        try:
+            node = doc.activeNode()
+        except Exception:
+            node = None
+        if node is None:
+            return
+
+        try:
+            root = doc.rootNode()
+        except Exception:
+            root = None
+        if root is None:
+            return
+
+        try:
+            root_children = root.childNodes() if callable(getattr(root, "childNodes", None)) else []
+        except Exception:
+            root_children = []
+
+        if not root_children:
+            return
+
+        # Use lower_layer action repeatedly
+        lower_action = _find_action_by_ids([
+            "move_layer_down", "lower_layer", "layer_lower", "LowerLayers",
+        ])
+        if lower_action is None:
+            lower_action = _find_action_by_text(["lower", "layer"])
+        if lower_action is None:
+            return
+
+        max_moves = len(root_children) + 50
+        for _ in range(max_moves):
+            try:
+                lower_action.trigger()
+                doc_now = app.activeDocument()
+                if doc_now is None:
+                    break
+                current_node = doc_now.activeNode()
+                if current_node is None:
+                    break
+                root_now = doc_now.rootNode()
+                if root_now is None:
+                    break
+                children_now = root_now.childNodes() if callable(getattr(root_now, "childNodes", None)) else []
+                if not children_now:
+                    break
+                current_uid = current_node.uniqueId() if callable(getattr(current_node, "uniqueId", None)) else None
+                first_uid = children_now[0].uniqueId() if callable(getattr(children_now[0], "uniqueId", None)) else None
+                if current_uid is not None and first_uid is not None and current_uid == first_uid:
+                    break
+            except Exception:
+                break
 
     def _on_window_created(self, *args):
         QTimer.singleShot(500, self._apply_to_all_windows)

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ActionCollection version="2" name="Scripts">
+    <Actions category="Scripts/Layer Kit">
+        <text>Layer Kit</text>
+
+        <Action name="layer_kit_move_to_top">
+            <icon></icon>
+            <text>Move to Top of Layer Stack</text>
+            <whatsThis>Move the selected layer to the very top of the entire layer stack.</whatsThis>
+            <toolTip>Move the selected layer to the very top of the entire layer stack.</toolTip>
+            <iconText>Move to Top of Layer Stack</iconText>
+            <activationFlags>10000</activationFlags>
+            <activationConditions>0</activationConditions>
+            <shortcut></shortcut>
+            <isCheckable>false</isCheckable>
+            <statusTip></statusTip>
+        </Action>
+
+        <Action name="layer_kit_move_to_bottom">
+            <icon></icon>
+            <text>Move to Bottom of Layer Stack</text>
+            <whatsThis>Move the selected layer to the very bottom of the entire layer stack.</whatsThis>
+            <toolTip>Move the selected layer to the very bottom of the entire layer stack.</toolTip>
+            <iconText>Move to Bottom of Layer Stack</iconText>
+            <activationFlags>10000</activationFlags>
+            <activationConditions>0</activationConditions>
+            <shortcut></shortcut>
+            <isCheckable>false</isCheckable>
+            <statusTip></statusTip>
+        </Action>
+
+        <Action name="layer_kit_create_clipping_mask">
+            <icon></icon>
+            <text>Create Clipping Mask</text>
+            <whatsThis>Enable alpha inheritance on the current layer and quick group it with the layer below.</whatsThis>
+            <toolTip>Create a clipping mask by enabling alpha inheritance and grouping with the layer below.</toolTip>
+            <iconText>Create Clipping Mask</iconText>
+            <activationFlags>10000</activationFlags>
+            <activationConditions>0</activationConditions>
+            <shortcut></shortcut>
+            <isCheckable>false</isCheckable>
+            <statusTip></statusTip>
+        </Action>
+
+    </Actions>
+</ActionCollection>
