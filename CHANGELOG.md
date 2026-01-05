@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Right-clicking arrow up/down buttons moves selected layers to the top or bottom
 - Keyboard shortcuts for Clipping mask and Move layers to top/bottom
-- Label box button's icon matches the color of your current layer's label color
+- Label box button's icon changes depending on your current layer's label color
 - This CHANGELOG.md
 
 ### Changed
