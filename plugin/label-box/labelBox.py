@@ -106,9 +106,17 @@ class LabelBox(Extension):
 
     def connectDocumentSignals(self, doc):
         """Connect signals for a document."""
-        if doc:
-            doc.nodeInserted.connect(self.onSelectionChanged)
-            doc.nodeRemoved.connect(self.onSelectionChanged)
+        if not doc:
+            return
+
+        # Krita builds differ on which Document signals are exposed; guard for compatibility.
+        node_inserted = getattr(doc, "nodeInserted", None)
+        if node_inserted is not None and hasattr(node_inserted, "connect"):
+            node_inserted.connect(self.onSelectionChanged)
+
+        node_removed = getattr(doc, "nodeRemoved", None)
+        if node_removed is not None and hasattr(node_removed, "connect"):
+            node_removed.connect(self.onSelectionChanged)
 
     def onSelectionChanged(self):
         """Update the button icon based on the currently selected layer(s)."""

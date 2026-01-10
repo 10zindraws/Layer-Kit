@@ -12,7 +12,8 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, List, Dict, Tuple
+import re
+from typing import Optional, List, Dict, Tuple, Set
 
 from krita import Extension, Krita
 
@@ -190,49 +191,162 @@ class MoveLayerToolButton(QToolButton):
 
 class GroupLayerLabeler(QObject):
     """
-    Monitors the document and automatically applies Krita's color label
-    to group layers. Uses Krita's native setColorLabel() method.
-    
+    Monitors the document and automatically:
+    1. Applies Krita's color label to group layers (using native setColorLabel() method)
+    2. Renames newly created groups to use sequential numbering independent of paint layers
+
     Color label indices in Krita:
     0 = None (no color)
     1 = Blue
-    2 = Green  
+    2 = Green
     3 = Yellow
     4 = Orange
     5 = Brown
     6 = Red
     7 = Purple
     8 = Grey
+
+    Group Renaming Logic:
+    - Krita by default names layers/groups with a shared counter (Paint layer 1, Group 2, Paint layer 3...)
+    - This class detects new groups matching the default pattern "Group N"
+    - It renames them to use a separate sequence (Group 1, Group 2, Group 3...)
+    - User-renamed groups (not matching "Group N" pattern) are left untouched
+
+    Detection Method:
+    - Uses Qt's QAbstractItemModel.rowsInserted signal from the layer tree view
+    - This is event-based and fires immediately when layers are added (no polling)
+    - Falls back to processing all groups on initial setup
     """
-    
+
     # Default color label for group layers (8 = Grey)
     GROUP_LABEL_COLOR = 8
-    
-    def __init__(self, parent: QObject = None):
+
+    # Regex pattern to match Krita's default group naming: "Group" followed by space and number
+    # This pattern matches: "Group 1", "Group 47", etc.
+    DEFAULT_GROUP_NAME_PATTERN = re.compile(r'^Group\s+(\d+)$', re.IGNORECASE)
+
+    def __init__(self, tree_view: Optional[QTreeView] = None, parent: QObject = None):
         super().__init__(parent)
-        self._labeled_nodes: set = set()  # Track nodes we've already labeled by uniqueId
-        self._timer: Optional[QTimer] = None
-    
+        self._labeled_nodes: Set[str] = set()  # Track nodes we've already labeled by uniqueId
+        self._renamed_nodes: Set[str] = set()  # Track nodes we've already processed for renaming
+        self._tree_view: Optional[QTreeView] = tree_view
+        self._model = None  # Store reference to connected model
+        self._connected = False
+        self._notifier_connected = False
+
     def start_monitoring(self) -> None:
-        """Start periodic monitoring for new group layers."""
-        if self._timer is not None:
+        """Start event-based monitoring for new group layers using model signals."""
+        if self._connected:
             return
-        
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._check_and_label_groups)
-        self._timer.start(1000)  # Check every second
-        
-        # Also do an immediate check
-        QTimer.singleShot(100, self._check_and_label_groups)
-    
+
+        # Connect to the layer tree view's model rowsInserted signal
+        if self._tree_view is not None:
+            self._connect_to_model()
+
+        # Connect to Krita's notifier for document/view changes
+        self._connect_to_notifier()
+
+        # Do an initial check to process any existing groups
+        QTimer.singleShot(100, self._check_and_process_groups)
+
+    def _connect_to_notifier(self) -> None:
+        """Connect to Krita's notifier for document and view change events."""
+        if self._notifier_connected:
+            return
+
+        try:
+            notifier = Krita.instance().notifier()
+            if notifier is not None:
+                # Reconnect to model when a new document is created
+                notifier.imageCreated.connect(self._on_image_created)
+                # Also handle view creation for document switching
+                notifier.viewCreated.connect(self._on_view_created)
+                self._notifier_connected = True
+        except Exception:
+            pass
+
+    def _on_image_created(self, doc) -> None:
+        """Handle imageCreated signal - reconnect to model and process groups."""
+        # Delay to allow the UI to update
+        QTimer.singleShot(5, self._reconnect_and_process)
+
+    def _on_view_created(self, view) -> None:
+        """Handle viewCreated signal - reconnect to model for the new view."""
+        # Delay to allow the UI to update
+        QTimer.singleShot(5, self._reconnect_and_process)
+
+    def _reconnect_and_process(self) -> None:
+        """Reconnect to the model and process groups."""
+        if self._tree_view is not None:
+            self._connect_to_model()
+        self._check_and_process_groups()
+
+    def _connect_to_model(self) -> None:
+        """Connect to the tree view's model rowsInserted signal."""
+        if self._tree_view is None:
+            return
+
+        try:
+            model = self._tree_view.model()
+            if model is not None and model != self._model:
+                # Disconnect from old model if exists
+                if self._model is not None:
+                    try:
+                        self._model.rowsInserted.disconnect(self._on_rows_inserted)
+                    except Exception:
+                        pass
+
+                # Connect to new model's rowsInserted signal
+                model.rowsInserted.connect(self._on_rows_inserted)
+                self._model = model
+                self._connected = True
+        except Exception:
+            pass
+
+    def _on_rows_inserted(self, parent, first: int, last: int) -> None:
+        """
+        Handle rowsInserted signal from the layer tree model.
+        This is called whenever new layers/nodes are added to the tree.
+
+        Args:
+            parent: QModelIndex of the parent item
+            first: First row index of inserted items
+            last: Last row index of inserted items (inclusive)
+        """
+        # Process immediately - the node is fully initialized when rowsInserted fires.
+        # Using a timer here would cause a visible flash as the view repaints before we rename.
+        self._check_and_process_groups()
+
     def stop_monitoring(self) -> None:
         """Stop monitoring."""
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
+        # Disconnect from model signals
+        if self._model is not None:
+            try:
+                self._model.rowsInserted.disconnect(self._on_rows_inserted)
+            except Exception:
+                pass
+            self._model = None
+        self._connected = False
+
+        # Disconnect from notifier signals
+        if self._notifier_connected:
+            try:
+                notifier = Krita.instance().notifier()
+                if notifier is not None:
+                    try:
+                        notifier.imageCreated.disconnect(self._on_image_created)
+                    except Exception:
+                        pass
+                    try:
+                        notifier.viewCreated.disconnect(self._on_view_created)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._notifier_connected = False
     
-    def _check_and_label_groups(self) -> None:
-        """Check all documents and label any unlabeled group layers."""
+    def _check_and_process_groups(self) -> None:
+        """Check all documents and process (label + rename) group layers."""
         try:
             app = Krita.instance()
             docs = app.documents()
@@ -240,12 +354,12 @@ class GroupLayerLabeler(QObject):
                 return
             
             for doc in docs:
-                self._label_groups_in_document(doc)
+                self._process_groups_in_document(doc)
         except Exception:
             pass
     
-    def _label_groups_in_document(self, doc) -> None:
-        """Recursively find and label group layers in a document."""
+    def _process_groups_in_document(self, doc) -> None:
+        """Process all group layers in a document: apply labeling and auto-rename new groups."""
         if doc is None:
             return
         
@@ -253,12 +367,23 @@ class GroupLayerLabeler(QObject):
             root = doc.rootNode()
             if root is None:
                 return
-            self._process_node_tree(root, doc)
+            
+            # First pass: collect all groups and find the highest existing group number
+            all_groups = []
+            self._collect_all_groups(root, all_groups)
+            
+            # Find the highest numbered group that follows the "Group N" pattern
+            highest_group_num = self._find_highest_group_number(all_groups)
+            
+            # Second pass: process each group (label + rename if needed)
+            for group_node in all_groups:
+                self._process_single_group(group_node, doc, highest_group_num)
+                
         except Exception:
             pass
     
-    def _process_node_tree(self, node, doc) -> None:
-        """Recursively process nodes and label groups."""
+    def _collect_all_groups(self, node, groups_list: List) -> None:
+        """Recursively collect all group layer nodes."""
         if node is None:
             return
         
@@ -269,56 +394,189 @@ class GroupLayerLabeler(QObject):
         
         for child in children:
             try:
-                # Check if this is a group layer (not a group mask)
                 node_type = child.type() if callable(getattr(child, "type", None)) else ""
                 node_type_lower = (node_type or "").lower()
                 
                 is_group = ("group" in node_type_lower) and ("mask" not in node_type_lower)
                 
                 if is_group:
-                    # Get unique identifier for tracking
-                    node_uid = None
-                    if callable(getattr(child, "uniqueId", None)):
-                        try:
-                            node_uid = child.uniqueId()
-                        except Exception:
-                            node_uid = None
-                    
-                    # Use name + type as fallback identifier
-                    if node_uid is None:
-                        try:
-                            node_name = child.name() if callable(getattr(child, "name", None)) else ""
-                            node_uid = f"{node_name}_{node_type}"
-                        except Exception:
-                            node_uid = id(child)
-                    
-                    # Check if already labeled by us
-                    if node_uid not in self._labeled_nodes:
-                        # Check current color label
-                        current_label = 0
-                        if callable(getattr(child, "colorLabel", None)):
-                            try:
-                                current_label = child.colorLabel()
-                            except Exception:
-                                current_label = 0
-                        
-                        # Only set label if not already set (0 = no color)
-                        if current_label == 0:
-                            if callable(getattr(child, "setColorLabel", None)):
-                                try:
-                                    child.setColorLabel(self.GROUP_LABEL_COLOR)
-                                    self._labeled_nodes.add(node_uid)
-                                except Exception:
-                                    pass
-                        else:
-                            # Already has a label, just track it
-                            self._labeled_nodes.add(node_uid)
+                    groups_list.append(child)
                 
                 # Recurse into children (groups can contain groups)
-                self._process_node_tree(child, doc)
+                self._collect_all_groups(child, groups_list)
                 
             except Exception:
                 continue
+    
+    def _find_highest_group_number(self, groups: List) -> int:
+        """
+        Find the highest number N from all groups named "Group N".
+        Returns 0 if no numbered groups exist.
+        """
+        highest = 0
+        
+        for group in groups:
+            try:
+                name = group.name() if callable(getattr(group, "name", None)) else ""
+                if not name:
+                    continue
+                
+                match = self.DEFAULT_GROUP_NAME_PATTERN.match(name.strip())
+                if match:
+                    num = int(match.group(1))
+                    if num > highest:
+                        highest = num
+            except Exception:
+                continue
+        
+        return highest
+    
+    def _get_node_uid(self, node) -> Optional[str]:
+        """Get a unique identifier for a node."""
+        node_uid = None
+        if callable(getattr(node, "uniqueId", None)):
+            try:
+                uid = node.uniqueId()
+                # uniqueId returns a QUuid, convert to string
+                node_uid = str(uid.toString()) if hasattr(uid, 'toString') else str(uid)
+            except Exception:
+                node_uid = None
+        
+        # Fallback identifier using name + type + some identifier
+        if node_uid is None:
+            try:
+                node_name = node.name() if callable(getattr(node, "name", None)) else ""
+                node_type = node.type() if callable(getattr(node, "type", None)) else ""
+                node_uid = f"{node_name}_{node_type}_{id(node)}"
+            except Exception:
+                node_uid = str(id(node))
+        
+        return node_uid
+    
+    def _process_single_group(self, group_node, doc, current_highest: int) -> None:
+        """Process a single group node: apply color label and rename if it's a new default-named group."""
+        try:
+            node_uid = self._get_node_uid(group_node)
+            if node_uid is None:
+                return
+            
+            # Get current group name
+            current_name = group_node.name() if callable(getattr(group_node, "name", None)) else ""
+            
+            # === RENAMING LOGIC ===
+            # Check if this group needs renaming (new group with default name)
+            if node_uid not in self._renamed_nodes:
+                # Check if name matches Krita's default pattern "Group N"
+                match = self.DEFAULT_GROUP_NAME_PATTERN.match(current_name.strip()) if current_name else None
+                
+                if match:
+                    # This is a default-named group - check if it needs renaming
+                    current_num = int(match.group(1))
+                    
+                    # Calculate what the next sequential number should be
+                    # We need to find the highest number among ALL other groups (excluding this one)
+                    other_highest = self._find_highest_excluding(doc, group_node)
+                    expected_next = other_highest + 1
+                    
+                    # If the current number is higher than expected, this is likely a new group
+                    # that inherited Krita's global counter and needs renaming
+                    if current_num > expected_next:
+                        new_name = f"Group {expected_next}"
+                        try:
+                            if callable(getattr(group_node, "setName", None)):
+                                group_node.setName(new_name)
+                                # Update the document to reflect changes
+                                if callable(getattr(doc, "refreshProjection", None)):
+                                    doc.refreshProjection()
+                        except Exception:
+                            pass
+                
+                # Mark as processed for renaming
+                self._renamed_nodes.add(node_uid)
+            
+            # === LABELING LOGIC ===
+            # Check if already labeled by us
+            if node_uid not in self._labeled_nodes:
+                # Check current color label
+                current_label = 0
+                if callable(getattr(group_node, "colorLabel", None)):
+                    try:
+                        current_label = group_node.colorLabel()
+                    except Exception:
+                        current_label = 0
+                
+                # Only set label if not already set (0 = no color)
+                if current_label == 0:
+                    if callable(getattr(group_node, "setColorLabel", None)):
+                        try:
+                            group_node.setColorLabel(self.GROUP_LABEL_COLOR)
+                            self._labeled_nodes.add(node_uid)
+                        except Exception:
+                            pass
+                else:
+                    # Already has a label, just track it
+                    self._labeled_nodes.add(node_uid)
+                    
+        except Exception:
+            pass
+    
+    def _find_highest_excluding(self, doc, exclude_node) -> int:
+        """
+        Find the highest group number, excluding a specific node.
+        This is used to determine what number a new group should have.
+        """
+        if doc is None:
+            return 0
+        
+        try:
+            root = doc.rootNode()
+            if root is None:
+                return 0
+            
+            exclude_uid = self._get_node_uid(exclude_node)
+            highest = 0
+            
+            def scan_nodes(parent):
+                nonlocal highest
+                if parent is None:
+                    return
+                
+                try:
+                    children = parent.childNodes() if callable(getattr(parent, "childNodes", None)) else []
+                except Exception:
+                    return
+                
+                for child in children:
+                    try:
+                        node_type = child.type() if callable(getattr(child, "type", None)) else ""
+                        node_type_lower = (node_type or "").lower()
+                        
+                        is_group = ("group" in node_type_lower) and ("mask" not in node_type_lower)
+                        
+                        if is_group:
+                            child_uid = self._get_node_uid(child)
+                            
+                            # Skip the excluded node
+                            if child_uid != exclude_uid:
+                                name = child.name() if callable(getattr(child, "name", None)) else ""
+                                if name:
+                                    match = self.DEFAULT_GROUP_NAME_PATTERN.match(name.strip())
+                                    if match:
+                                        num = int(match.group(1))
+                                        if num > highest:
+                                            highest = num
+                        
+                        # Recurse into children
+                        scan_nodes(child)
+                        
+                    except Exception:
+                        continue
+            
+            scan_nodes(root)
+            return highest
+            
+        except Exception:
+            return 0
 
 
 class LayersDockerPatcher(QObject):
@@ -1242,14 +1500,15 @@ class LayersDockerPatcher(QObject):
 
     def _install_group_layer_labeling(self) -> None:
         """Install automatic color labeling for group layers using Krita's native system."""
-        # Find tree for reference (used by other methods)
+        # Find tree for reference (used by other methods and for event-based detection)
         self.tree = self._find_layer_tree_view()
-        
+
         # Avoid double-initialization
         if self.docker.property("layer_kit_labeler") is True:
             return
 
-        self._labeler = GroupLayerLabeler(self.docker)
+        # Pass the tree view to enable event-based detection via rowsInserted signal
+        self._labeler = GroupLayerLabeler(tree_view=self.tree, parent=self.docker)
         self._labeler.start_monitoring()
         self.docker.setProperty("layer_kit_labeler", True)
 

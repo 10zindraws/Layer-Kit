@@ -1,6 +1,15 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [1.1.6] - 2026-01-10
+
+### Added
+- New groups are instantly renamed after the number of existing groups, not layers (krita considers groups as layers)
+
+### Changed
+- LabelBox: account for different version .kra imports
+- Optimization: plugin detects direct change to the layer tree instead of using a repeating interval
+
 
 ## [1.1.0] - 2026-01-05
 
