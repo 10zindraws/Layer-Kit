@@ -1,6 +1,13 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [1.1.7] - 2026-01-12
+
+### Changed
+- Alpha inheritance change is included with the clipping mask undo stack
+- Label-box width made smaller to be symmetrical with the clipping mask button
+
+
 ## [1.1.6] - 2026-01-10
 
 ### Added

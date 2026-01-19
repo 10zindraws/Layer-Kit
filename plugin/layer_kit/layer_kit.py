@@ -189,6 +189,207 @@ class MoveLayerToolButton(QToolButton):
                 pass
 
 
+class ClippingMaskUndoMonitor(QObject):
+    """
+    Event-based monitor for detecting when a clipping mask's quick group is undone.
+    
+    Uses Qt model signals (rowsRemoved, layoutChanged) and Krita's notifier
+    to detect when the layer structure changes. When the monitored node's parent
+    changes (indicating the quick group was undone), restores the original
+    alpha inheritance state.
+    
+    This provides a clean single-undo experience where both the grouping and
+    the alpha inheritance change are effectively reversed together.
+    """
+    
+    def __init__(
+        self,
+        patcher: 'LayersDockerPatcher',
+        node_uid,
+        node_name: str,
+        node_type: str,
+        parent_uid,
+        original_alpha_state: bool,
+        tree_view: Optional[QTreeView] = None,
+        parent: QObject = None
+    ):
+        super().__init__(parent)
+        self._patcher = patcher
+        self._node_uid = node_uid
+        self._node_name = node_name
+        self._node_type = node_type
+        self._parent_uid = parent_uid
+        self._original_alpha_state = original_alpha_state
+        self._tree_view = tree_view
+        self._model = None
+        self._connected = False
+        self._stopped = False
+    
+    def start_monitoring(self) -> None:
+        """Start event-based monitoring for undo detection."""
+        if self._connected or self._stopped:
+            return
+        
+        # Connect to the layer tree view's model signals
+        if self._tree_view is not None:
+            self._connect_to_model()
+        
+        # Connect to Krita's notifier for image changes
+        self._connect_to_notifier()
+        
+        self._connected = True
+    
+    def _connect_to_model(self) -> None:
+        """Connect to the tree view's model signals for structure changes."""
+        if self._tree_view is None:
+            return
+        
+        try:
+            model = self._tree_view.model()
+            if model is not None:
+                self._model = model
+                # Connect to signals that fire when layer structure changes
+                model.rowsRemoved.connect(self._on_structure_changed)
+                model.rowsInserted.connect(self._on_structure_changed)
+                model.layoutChanged.connect(self._on_structure_changed)
+        except Exception:
+            pass
+    
+    def _connect_to_notifier(self) -> None:
+        """Connect to Krita's notifier for image modification events."""
+        try:
+            notifier = Krita.instance().notifier()
+            if notifier is not None:
+                # imageUpdated fires on many changes including undo
+                if hasattr(notifier, 'imageUpdated'):
+                    notifier.imageUpdated.connect(self._on_structure_changed)
+        except Exception:
+            pass
+    
+    def _on_structure_changed(self, *args) -> None:
+        """Handle structure change signals - check if undo occurred."""
+        if self._stopped:
+            return
+        
+        try:
+            self._check_for_undo()
+        except Exception:
+            pass
+    
+    def _check_for_undo(self) -> None:
+        """Check if the quick group has been undone by examining the node's parent."""
+        if self._stopped:
+            return
+        
+        app = Krita.instance()
+        doc = app.activeDocument()
+        if doc is None:
+            return
+        
+        # Find the node
+        current_node = None
+        if self._node_uid is not None:
+            try:
+                current_node = doc.nodeByUniqueID(self._node_uid) if callable(getattr(doc, "nodeByUniqueID", None)) else None
+            except Exception:
+                pass
+        
+        if current_node is None and self._node_name is not None:
+            current_node = self._patcher._find_node_by_name_and_type(doc, self._node_name, self._node_type)
+        
+        if current_node is None:
+            # Node not found, stop monitoring
+            self._stop_monitoring()
+            return
+        
+        # Check if the node's parent has changed
+        current_parent = None
+        try:
+            current_parent = current_node.parentNode() if callable(getattr(current_node, "parentNode", None)) else None
+        except Exception:
+            pass
+        
+        if current_parent is None:
+            # Node has no parent, undo likely happened
+            self._restore_and_stop(current_node)
+            return
+        
+        # Check if the parent is still the same group
+        current_parent_uid = None
+        try:
+            current_parent_uid = current_parent.uniqueId() if callable(getattr(current_parent, "uniqueId", None)) else None
+        except Exception:
+            pass
+        
+        # Check parent type
+        current_parent_type = ""
+        try:
+            current_parent_type = (current_parent.type() if callable(getattr(current_parent, "type", None)) else "").lower()
+        except Exception:
+            pass
+        
+        # If parent changed (different UID) or parent is no longer a group, undo happened
+        parent_changed = (self._parent_uid is not None and current_parent_uid is not None and self._parent_uid != current_parent_uid)
+        parent_not_group = "group" not in current_parent_type or current_parent_type == "rootlayer"
+        
+        if parent_changed or parent_not_group:
+            # Undo detected - restore original alpha state
+            self._restore_and_stop(current_node)
+    
+    def _restore_and_stop(self, node) -> None:
+        """Restore alpha state and stop monitoring."""
+        if self._stopped:
+            return
+        
+        # Restore the original alpha inheritance state
+        self._patcher._restore_alpha_state(node, self._original_alpha_state)
+        
+        # Stop monitoring
+        self._stop_monitoring()
+    
+    def _stop_monitoring(self) -> None:
+        """Disconnect all signals and stop monitoring."""
+        if self._stopped:
+            return
+        
+        self._stopped = True
+        self._connected = False
+        
+        # Disconnect from model signals
+        if self._model is not None:
+            try:
+                self._model.rowsRemoved.disconnect(self._on_structure_changed)
+            except Exception:
+                pass
+            try:
+                self._model.rowsInserted.disconnect(self._on_structure_changed)
+            except Exception:
+                pass
+            try:
+                self._model.layoutChanged.disconnect(self._on_structure_changed)
+            except Exception:
+                pass
+            self._model = None
+        
+        # Disconnect from notifier
+        try:
+            notifier = Krita.instance().notifier()
+            if notifier is not None and hasattr(notifier, 'imageUpdated'):
+                try:
+                    notifier.imageUpdated.disconnect(self._on_structure_changed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
+        # Remove from patcher's list
+        if hasattr(self._patcher, '_undo_monitors'):
+            try:
+                self._patcher._undo_monitors.remove(self)
+            except (ValueError, AttributeError):
+                pass
+
+
 class GroupLayerLabeler(QObject):
     """
     Monitors the document and automatically:
@@ -1133,10 +1334,11 @@ class LayersDockerPatcher(QObject):
         """
         Implements:
           1) Check if there is a layer below the current node (abort if not)
-          2) Enable inherit alpha on current node (using Krita's action for undo support)
+          2) Enable inherit alpha on current node (without undo entry)
           3) Add layer below to selection (multi-select)
           4) Quick Group the two layers
           5) Ensure the top (clipped) layer is the active/selected layer (only)
+          6) Monitor for undo via signals and restore alpha inheritance state if group is dissolved
         """
         app = Krita.instance()
         doc = app.activeDocument()
@@ -1159,17 +1361,21 @@ class LayersDockerPatcher(QObject):
             # No layer below - cannot create clipping mask, silently abort
             return
 
-        # Store node info for finding it later
+        # Store node info for finding it later and for undo monitoring
         node_name = None
         node_type = None
+        node_uid = None
+        original_alpha_state = False
         try:
             node_name = node.name() if callable(getattr(node, "name", None)) else None
             node_type = node.type() if callable(getattr(node, "type", None)) else None
+            node_uid = node.uniqueId() if callable(getattr(node, "uniqueId", None)) else None
+            original_alpha_state = node.inheritAlpha() if callable(getattr(node, "inheritAlpha", None)) else False
         except Exception:
             pass
 
         # 1) Turn on alpha inheritance for current node
-        # Use Krita's built-in action for proper undo support via KisNodePropertyListCommand
+        # Uses direct API call (no undo entry) so we can manage undo ourselves
         self._trigger_inherit_alpha_action(node)
 
         # 2) Add the layer below as selected
@@ -1179,7 +1385,8 @@ class LayersDockerPatcher(QObject):
         self._trigger_quick_group_action()
 
         # 4) Restore active node selection to the original top layer
-        def restore_selection():
+        # 5) Start event-based monitoring for undo to restore alpha state
+        def restore_selection_and_monitor():
             try:
                 doc_now = app.activeDocument()
                 if doc_now is None:
@@ -1203,13 +1410,86 @@ class LayersDockerPatcher(QObject):
                     
                     self._select_only_node_in_view(target_node)
                     self._set_active_node(doc_now, target_node)
+                    
+                    # Start event-based monitoring for undo
+                    # Uses model signals and Krita notifier instead of polling
+                    self._start_undo_monitor(
+                        doc_now, target_node, node_uid, node_name, node_type, original_alpha_state
+                    )
                 
                 if self.tree is not None:
                     self.tree.viewport().update()
             except Exception:
                 pass
 
-        QTimer.singleShot(150, restore_selection)
+        QTimer.singleShot(150, restore_selection_and_monitor)
+
+    def _start_undo_monitor(self, doc, node, node_uid, node_name, node_type, original_alpha_state) -> None:
+        """
+        Monitor for undo of the quick group operation using event-based signals.
+        
+        When the clipping mask is created, the node ends up inside a group layer.
+        If the user undoes, the quick group is reversed and the node will no longer
+        be inside a group. When we detect this via signals, we restore the original alpha state.
+        
+        This provides a clean single-undo experience where both the grouping and
+        the alpha inheritance change are effectively reversed together.
+        """
+        app = Krita.instance()
+        
+        # Get the parent of the node after grouping - it should be a group layer
+        parent_after_group = None
+        try:
+            parent_after_group = node.parentNode() if callable(getattr(node, "parentNode", None)) else None
+        except Exception:
+            parent_after_group = None
+        
+        if parent_after_group is None:
+            return
+        
+        # Check if parent is actually a group (not root)
+        parent_type = ""
+        try:
+            parent_type = (parent_after_group.type() if callable(getattr(parent_after_group, "type", None)) else "").lower()
+        except Exception:
+            parent_type = ""
+        
+        # If parent is not a group layer, no monitoring needed
+        if "group" not in parent_type:
+            return
+        
+        parent_uid = None
+        try:
+            parent_uid = parent_after_group.uniqueId() if callable(getattr(parent_after_group, "uniqueId", None)) else None
+        except Exception:
+            parent_uid = None
+        
+        # Create an undo monitor that uses event-based detection
+        monitor = ClippingMaskUndoMonitor(
+            patcher=self,
+            node_uid=node_uid,
+            node_name=node_name,
+            node_type=node_type,
+            parent_uid=parent_uid,
+            original_alpha_state=original_alpha_state,
+            tree_view=self.tree
+        )
+        monitor.start_monitoring()
+        
+        # Store reference to prevent garbage collection
+        if not hasattr(self, '_undo_monitors'):
+            self._undo_monitors = []
+        self._undo_monitors.append(monitor)
+
+    def _restore_alpha_state(self, node, original_state: bool) -> None:
+        """Restore the alpha inheritance state to its original value."""
+        try:
+            if callable(getattr(node, "setInheritAlpha", None)):
+                current_state = node.inheritAlpha() if callable(getattr(node, "inheritAlpha", None)) else False
+                if current_state != original_state:
+                    node.setInheritAlpha(original_state)
+        except Exception:
+            pass
 
     def _trigger_quick_group_action(self) -> bool:
         act = _find_action_by_ids([
@@ -1233,11 +1513,19 @@ class LayersDockerPatcher(QObject):
 
     def _trigger_inherit_alpha_action(self, node) -> bool:
         """
-        Enable inherit alpha on the given node using Krita's built-in action.
-        This ensures proper undo support via KisNodePropertyListCommand.
+        Enable inherit alpha on the given node using direct API call.
         
-        The action toggles the state, so we first check current state
-        and only trigger if alpha inheritance is not already enabled.
+        We intentionally use the direct setInheritAlpha() call instead of Krita's
+        built-in action. This ensures that the alpha inheritance change is NOT
+        added to the undo stack as a separate action.
+        
+        When combined with quick group, this means:
+        - Only the quick group action is in the undo stack
+        - When user undoes, the group is dissolved
+        - The layer retains alpha inheritance, but since it's no longer in a group,
+          the alpha inheritance has no visual effect (it only affects layers within groups)
+        
+        This provides a cleaner single-undo experience for the clipping mask feature.
         """
         # Check if alpha inheritance is already enabled
         already_enabled = False
@@ -1248,27 +1536,11 @@ class LayersDockerPatcher(QObject):
             pass
         
         if already_enabled:
-            # Already enabled, no need to toggle
+            # Already enabled, no need to change
             return True
         
-        # Try to use Krita's built-in action for proper undo support
-        act = _find_action_by_ids([
-            "toggle_layer_inherit_alpha",
-            "toggle_inherit_alpha", 
-            "inherit_alpha",
-            "layer_inherit_alpha",
-        ])
-        if act is None:
-            act = _find_action_by_text(["inherit", "alpha"])
-        
-        if act is not None:
-            try:
-                act.trigger()
-                return True
-            except Exception:
-                pass
-        
-        # Fallback: direct call (no undo support, but better than nothing)
+        # Use direct API call - this does NOT create an undo entry,
+        # which is intentional so that undo only needs to reverse the quick group
         try:
             if callable(getattr(node, "setInheritAlpha", None)):
                 node.setInheritAlpha(True)
